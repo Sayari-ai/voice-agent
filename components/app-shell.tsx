@@ -70,7 +70,7 @@ function SidebarInner({ pathname }: { pathname: string }) {
       </nav>
       <div className="space-y-3 border-t border-slate-100 px-5 py-4">
         <Link
-          href="/"
+          href="/customer"
           className="flex items-center gap-1.5 text-xs font-medium text-navy-700 hover:text-navy-950"
         >
           View customer app <ArrowUpRight className="h-3.5 w-3.5" />
