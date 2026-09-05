@@ -18,8 +18,6 @@ import {
 import { Bar, Chip, DemoBadge, Logo } from "@/components/ui";
 import { scenarios, type Scenario } from "@/lib/scenarios";
 import { Waveform } from "@/components/live/waveform";
-import { BALANCE_DATA, decide } from "@/lib/wolof-agent";
-import { fetchTts } from "@/lib/tts-client";
 import { useSpeechHealth } from "@/lib/use-speech-health";
 
 type Phase = "idle" | "listening" | "thinking" | "responding" | "done";
@@ -111,24 +109,6 @@ function BalanceCard({ scenario }: { scenario: Scenario }) {
   );
 }
 
-function LiveBalanceCard() {
-  return (
-    <div className="animate-fade-up ml-auto w-full max-w-[85%] rounded-xl border border-gold-200 bg-gold-50/60 p-4">
-      <div className="flex items-center justify-between gap-2">
-        <p className="text-xs font-medium text-navy-700">{BALANCE_DATA.bundle}</p>
-        {BALANCE_DATA.autoRenew && <Chip tone="green">Auto-renew on</Chip>}
-      </div>
-      <p className="mt-2 text-2xl font-semibold tracking-tight text-navy-950">
-        {BALANCE_DATA.remainingGb} GB <span className="text-sm font-normal text-slate-500">remaining</span>
-      </p>
-      <div className="mt-2">
-        <Bar value={(BALANCE_DATA.remainingGb / 10) * 100} />
-      </div>
-      <p className="mt-2 text-xs text-slate-500">Expires {BALANCE_DATA.expires} · Simulated BSS</p>
-    </div>
-  );
-}
-
 function HandoffCard({ handoff }: { handoff: Handoff }) {
   return (
     <div className="animate-fade-up ml-auto w-full max-w-[85%] rounded-xl border border-red-200 bg-red-50/60 p-4">
@@ -167,7 +147,7 @@ function MessageBubble({ msg, scenario }: { msg: Msg; scenario: Scenario | null 
     );
   }
   if (msg.card === "balance") {
-    return scenario ? <BalanceCard scenario={scenario} /> : <LiveBalanceCard />;
+    return scenario ? <BalanceCard scenario={scenario} /> : null;
   }
   if (msg.card === "handoff" && msg.handoff) return <HandoffCard handoff={msg.handoff} />;
 
@@ -213,6 +193,7 @@ export function CustomerAssistant() {
   const chunks = useRef<Blob[]>([]);
   const audioEl = useRef<HTMLAudioElement | null>(null);
   const audioUrl = useRef<string | null>(null);
+  const sessionId = useRef("");
 
   const patch = (p: Partial<AssistantState>) => setState((s) => ({ ...s, ...p }));
   const push = (m: Omit<Msg, "id">) =>
@@ -262,31 +243,41 @@ export function CustomerAssistant() {
     []
   );
 
-  const speak = async (text: string, l: Lang, onDone: () => void) => {
+  const playAgentAudio = (base64: string, onDone: () => void) => {
     try {
-      const { blob } = await fetchTts(text, l);
+      const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
       releaseAudio();
-      audioUrl.current = URL.createObjectURL(blob);
+      audioUrl.current = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
       const audio = new Audio(audioUrl.current);
       audioEl.current = audio;
       audio.onended = onDone;
       audio.onerror = onDone;
-      await audio.play();
+      void audio.play().catch(onDone);
     } catch {
       onDone();
     }
   };
 
-  const transcribeClip = async (blob: Blob, l: Lang) => {
+  // One voice turn against the real agent (INTEGRATION.md §9): ASR + LLM + TTS
+  // server-side; session_id keeps the conversation context across turns.
+  const agentTurn = async (blob: Blob, l: Lang) => {
     patch({ phase: "thinking" });
     try {
       const form = new FormData();
       const ext = blob.type.includes("mp4") ? "mp4" : "webm";
       form.append("file", blob, `clip.${ext}`);
       form.append("lang", l);
-      const res = await fetch("/api/transcribe", { method: "POST", body: form });
-      if (!res.ok) throw new Error(`ASR ${res.status}`);
-      const data = (await res.json()) as { text: string; model?: string };
+      form.append("session_id", sessionId.current);
+      form.append("gender", "female");
+      const res = await fetch("/api/agent", { method: "POST", body: form });
+      if (!res.ok) throw new Error(`Agent ${res.status}`);
+      const data = (await res.json()) as {
+        sessionId: string;
+        text: string;
+        responseText: string;
+        model?: string;
+        audioBase64: string;
+      };
       const text = data.text?.trim();
       if (!text) {
         stopTicker();
@@ -294,33 +285,21 @@ export function CustomerAssistant() {
         patch({ phase: "idle", mode: null });
         return;
       }
+      sessionId.current = data.sessionId || sessionId.current;
       push({ role: "customer", primary: text, lang: LANG_META[l].label });
-      const d = decide(text);
       patch({ phase: "responding", playing: true });
       push({
         role: "agent",
-        primary: d.reply.wolof,
-        english: d.reply.english,
+        primary: data.responseText,
         lang: LANG_META[l].label,
       });
-      if (d.card) push({ role: "agent", card: d.card, handoff: d.handoff });
-      void speak(d.reply.wolof, l, () => {
+      playAgentAudio(data.audioBase64, () => {
         stopTicker();
-        if (d.endsCall) {
-          patch({ playing: false, phase: "done", outcome: d.handoff ? "human" : "resolved" });
-          push({
-            role: "status",
-            text: d.handoff
-              ? "Hold the line a human specialist will pick up shortly"
-              : `Resolved live by ${data.model ?? "the Afriklang Wolof model"}`,
-          });
-        } else {
-          patch({ playing: false, phase: "idle", mode: null });
-        }
+        patch({ playing: false, phase: "idle", mode: null });
       });
     } catch {
       stopTicker();
-      push({ role: "status", text: "Speech service unavailable please try again shortly" });
+      push({ role: "status", text: "Agent service unavailable please try again shortly" });
       patch({ phase: "idle", mode: null });
     }
   };
@@ -347,7 +326,7 @@ export function CustomerAssistant() {
       rec.onstop = () => {
         const blob = new Blob(chunks.current, { type: rec.mimeType || "audio/webm" });
         releaseMic();
-        void transcribeClip(blob, lang);
+        void agentTurn(blob, lang);
       };
       setSeconds(0);
       stopTicker();
@@ -462,6 +441,7 @@ export function CustomerAssistant() {
     stopTicker();
     releaseMic();
     releaseAudio();
+    sessionId.current = "";
     setSeconds(0);
     setState(initialState);
   };
@@ -484,7 +464,7 @@ export function CustomerAssistant() {
           : "Ina sauraro… · Listening…"
         : state.phase === "thinking"
           ? live
-            ? "Transcribing your voice on the Afriklang model…"
+            ? "The assistant is thinking about your request…"
             : "Ina duba maka… · Checking that for you…"
           : state.playing
             ? "Assistant is speaking…"

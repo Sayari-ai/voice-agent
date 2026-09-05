@@ -1,9 +1,14 @@
 const ASR_API_URL = process.env.ASR_API_URL ?? "https://asr.afriklang.com";
 
 const LANGS = new Set(["wo"]);
+const GENDERS = new Set(["female", "male"]);
 
 export async function POST(req: Request) {
-  const { text, lang = "wo" } = (await req.json()) as { text?: string; lang?: string };
+  const {
+    text,
+    lang = "wo",
+    gender = "female",
+  } = (await req.json()) as { text?: string; lang?: string; gender?: string };
 
   if (!text?.trim()) {
     return Response.json({ error: "Text is required" }, { status: 400 });
@@ -15,7 +20,7 @@ export async function POST(req: Request) {
   const res = await fetch(`${ASR_API_URL}/tts/${lang}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ text, gender: GENDERS.has(gender) ? gender : "female" }),
   });
 
   if (!res.ok || !res.body) {
